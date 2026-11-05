@@ -1,4 +1,4 @@
 {
   "_comment": "Add Roblox UserId numbers to 'userids' to grant access to the CPanel developer dashboard. Everyone else who connects is a regular participant. Reload/redeploy the server after editing.",
-  "userids": []
+  "userids": [10951598942]
 }
