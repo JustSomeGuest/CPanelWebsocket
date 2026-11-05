@@ -1,0 +1,17 @@
+{
+  "name": "cpanel-websocket",
+  "version": "1.0.0",
+  "description": "Shared WebSocket backend for CPanel - participant registration, developer access and command routing",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "test": "node test.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  },
+  "license": "MIT"
+}
