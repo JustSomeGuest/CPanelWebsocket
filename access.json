@@ -1,4 +1,4 @@
 {
   "_comment": "Add Roblox UserIds to the 'userids' array to grant access to the CPanel developer dashboard. Users whose IDs are listed will have developer access, while all other users who connect will join as regular participants. Changes require a server reload or redeployment to take effect. Example: [1] or [1, 2].",
-  "userids": [11930215114]
+  "userids": [10951598942, 11930215114]
 }
