@@ -1,6 +1,6 @@
 {
   "name": "cpanel-websocket",
-  "version": "1.1.0",
+  "version": "1.0.0",
   "description": "Shared WebSocket backend for CPanel - participant registration, developer access and command routing",
   "main": "index.js",
   "scripts": {
