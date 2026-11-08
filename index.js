@@ -1,54 +1,35 @@
 'use strict';
 
-/*
- * CPanel WebSocket backend
- * ------------------------------------------------------------------
- * Shared WebSocket service used by every CPanel client (participants
- * and developers connect to the same endpoint).
- *
- * Responsibilities:
- *   - participant registration / session identification
- *   - developer access validation (access.json)
- *   - active participant lists for developers
- *   - individual command routing (developer -> single session)
- *   - command acknowledgements (participant -> developer)
- *   - reconnection / duplicate-session handling
- *   - disconnect cleanup and session expiration (heartbeat sweep)
- *   - rate limiting, message size limits, error handling
- *
- * IMPORTANT / HONEST SECURITY NOTE:
- *   Roblox gives this server no verifiable proof of who a client is.
- *   Identity is whatever userId the client declares, so the access
- *   check below is a soft gate, NOT strong authentication. Treat
- *   access.json as "who may open the dashboard", not as a security
- *   boundary, and never put secrets in client code.
- * ------------------------------------------------------------------
- */
-
 const http = require('http');
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 const { WebSocketServer } = require('ws');
 
-// ------------------------------------------------------------------
-// Configuration (environment overrides are used by tests and hosting)
-// ------------------------------------------------------------------
 function intEnv(name, fallback) {
   const raw = process.env[name];
   const value = Number.parseInt(raw, 10);
   return Number.isFinite(value) && value > 0 ? value : fallback;
 }
 
+function strEnv(name) {
+  const raw = process.env[name];
+  return typeof raw === 'string' && raw.trim() !== '' ? raw.trim() : '';
+}
+
 const PORT = (() => {
   const raw = process.env.PORT;
   if (raw === undefined || raw === '') return 8080;
   const value = Number.parseInt(raw, 10);
-  // 0 = ephemeral port (used by the integration test); Render provides a real port.
+
   return Number.isFinite(value) && value >= 0 ? value : 8080;
 })();
 const HOST = process.env.HOST || '0.0.0.0';
 const ACCESS_FILE = process.env.ACCESS_FILE || path.join(__dirname, 'access.json');
+const DEV_TOKEN_FILE = process.env.DEV_TOKEN_FILE || path.join(__dirname, 'devToken.txt');
+const DEV_TOKEN_MIN_LENGTH = intEnv('DEV_TOKEN_MIN_LENGTH', 16);
+const DEV_TOKEN_FAIL_LIMIT = intEnv('DEV_TOKEN_FAIL_LIMIT', 20);
+const DEV_TOKEN_FAIL_WINDOW_MS = intEnv('DEV_TOKEN_FAIL_WINDOW_MS', 300000);
 const HEARTBEAT_INTERVAL_MS = intEnv('HEARTBEAT_INTERVAL_MS', 30000);
 const HEARTBEAT_TIMEOUT_MS = intEnv('HEARTBEAT_TIMEOUT_MS', 90000);
 const MAX_MESSAGE_BYTES = intEnv('MAX_MESSAGE_BYTES', 64 * 1024);
@@ -60,9 +41,6 @@ const ACK_TIMEOUT_MS = intEnv('ACK_TIMEOUT_MS', 15000);
 const ACCESS_WATCH_INTERVAL_MS = intEnv('ACCESS_WATCH_INTERVAL_MS', 3000);
 const START_TIME = Date.now();
 
-// ------------------------------------------------------------------
-// Logging
-// ------------------------------------------------------------------
 function log(level, message, extra) {
   const line = `[${new Date().toISOString()}] [${level}] ${message}`;
   if (extra !== undefined) {
@@ -72,9 +50,6 @@ function log(level, message, extra) {
   }
 }
 
-// ------------------------------------------------------------------
-// Access list (access.json lives on the WebSocket, not in client code)
-// ------------------------------------------------------------------
 const access = {
   userids: new Set(),
   raw: [],
@@ -123,7 +98,7 @@ function watchAccessFile() {
   try {
     fs.watch(ACCESS_FILE, { persistent: false }, () => {
       if (loadAccess('reloaded (fs.watch)')) {
-        broadcastAccess();
+        revalidateRoles();
       }
     });
   } catch (error) {
@@ -132,7 +107,7 @@ function watchAccessFile() {
   try {
     fs.watchFile(ACCESS_FILE, { interval: ACCESS_WATCH_INTERVAL_MS, persistent: false }, (current, previous) => {
       if (current.mtimeMs !== previous.mtimeMs && loadAccess('reloaded (fs.watchFile)')) {
-        broadcastAccess();
+        revalidateRoles();
       }
     });
   } catch (error) {
@@ -146,9 +121,65 @@ function isDeveloperId(userId) {
   return access.userids.has(userId);
 }
 
-// ------------------------------------------------------------------
-// Helpers
-// ------------------------------------------------------------------
+function loadDevToken() {
+  const fromEnv = strEnv('CPANEL_DEV_TOKEN');
+  if (fromEnv !== '') {
+    if (fromEnv.length < DEV_TOKEN_MIN_LENGTH) {
+      log('warn', `CPANEL_DEV_TOKEN is shorter than ${DEV_TOKEN_MIN_LENGTH} characters; refusing to load it`);
+      return '';
+    }
+    return fromEnv;
+  }
+  try {
+    const fromFile = fs.readFileSync(DEV_TOKEN_FILE, 'utf8').trim();
+    if (fromFile === '') return '';
+    if (fromFile.length < DEV_TOKEN_MIN_LENGTH) {
+      log('warn', `${DEV_TOKEN_FILE} holds a token shorter than ${DEV_TOKEN_MIN_LENGTH} characters; refusing to load it`);
+      return '';
+    }
+    return fromFile;
+  } catch (error) {
+    return '';
+  }
+}
+
+function verifyDevToken(candidate) {
+  if (DEV_TOKEN === '') return false;
+  if (typeof candidate !== 'string') return false;
+  const value = candidate.trim();
+  if (value.length !== DEV_TOKEN.length) return false;
+  const provided = Buffer.from(value, 'utf8');
+  const expected = Buffer.from(DEV_TOKEN, 'utf8');
+  if (provided.length !== expected.length) return false;
+  return crypto.timingSafeEqual(provided, expected);
+}
+
+function devTokenLocked(remote) {
+  const entry = devTokenFailures.get(remote);
+  if (!entry) return false;
+  if (Date.now() - entry.windowStart > DEV_TOKEN_FAIL_WINDOW_MS) {
+    devTokenFailures.delete(remote);
+    return false;
+  }
+  return entry.count >= DEV_TOKEN_FAIL_LIMIT;
+}
+
+function noteDevTokenFailure(remote) {
+  const now = Date.now();
+  let entry = devTokenFailures.get(remote);
+  if (!entry || now - entry.windowStart > DEV_TOKEN_FAIL_WINDOW_MS) {
+    entry = { windowStart: now, count: 0 };
+    devTokenFailures.set(remote, entry);
+  }
+  entry.count += 1;
+  if (entry.count === DEV_TOKEN_FAIL_LIMIT) {
+    log('warn', `${entry.count} invalid developer tokens from ${remote} within ${DEV_TOKEN_FAIL_WINDOW_MS}ms`);
+  }
+}
+
+const devTokenFailures = new Map();
+const DEV_TOKEN = loadDevToken();
+
 function cleanString(value, maxLength, fallback) {
   if (typeof value !== 'string') return fallback;
   const trimmed = value.trim();
@@ -176,14 +207,10 @@ function sendError(socket, code, message) {
   return safeSend(socket, { type: 'error', code, message });
 }
 
-// ------------------------------------------------------------------
-// Session registry
-// ------------------------------------------------------------------
-/** sessionId -> session */
 const sessions = new Map();
-/** "userId#jobId" -> sessionId (duplicate-session detection) */
+
 const sessionKeys = new Map();
-/** requestId -> { originId, targetId, timer } */
+
 const pendingCommands = new Map();
 
 function publicSession(session) {
@@ -221,8 +248,20 @@ function broadcastToAll(payload) {
   }
 }
 
-function broadcastAccess() {
-  broadcastToAll({ type: 'access', userids: access.raw.slice() });
+function revalidateRoles() {
+  for (const session of Array.from(sessions.values())) {
+    if (!session.registered) continue;
+    const wanted = isDeveloperId(session.userId) && session.devTokenOk === true ? 'developer' : 'participant';
+    if (wanted === session.role) continue;
+    session.role = wanted;
+    log('info', `role re-evaluated for ${session.id} user=${session.userId} -> ${wanted}`);
+    if (wanted === 'participant') {
+      try {
+        session.socket.close(4403, 'developer access revoked');
+      } catch (error) {}
+    }
+  }
+  broadcastParticipantList();
 }
 
 function broadcastParticipantList() {
@@ -231,9 +270,6 @@ function broadcastParticipantList() {
   broadcastToDevelopers({ type: 'participants', list });
 }
 
-// ------------------------------------------------------------------
-// Session lifecycle
-// ------------------------------------------------------------------
 function removeSession(session, reason) {
   if (!session || session.removed) return;
   session.removed = true;
@@ -242,7 +278,6 @@ function removeSession(session, reason) {
     sessionKeys.delete(session.key);
   }
 
-  // Settle any commands that were waiting on this session.
   for (const [requestId, pending] of Array.from(pendingCommands.entries())) {
     if (pending.targetId === session.id) {
       clearTimeout(pending.timer);
@@ -288,8 +323,6 @@ function handleRegister(session, message) {
   const jobId = cleanString(message.jobId, 64, 'unknown');
   const key = `${userId}#${jobId}`;
 
-  // Duplicate session: same user in the same server instance (rejoin /
-  // reconnection race) -> drop the stale socket, keep the fresh one.
   const existingId = sessionKeys.get(key);
   if (existingId) {
     const existing = sessions.get(existingId);
@@ -299,7 +332,7 @@ function handleRegister(session, message) {
       removeSession(existing, 'duplicate');
       try {
         existing.socket.close(4400, 'duplicate session');
-      } catch (error) { /* already gone */ }
+      } catch (error) {  }
     }
   }
 
@@ -309,9 +342,19 @@ function handleRegister(session, message) {
   session.displayName = cleanString(message.displayName, 64, session.username);
   session.placeId = cleanInt(message.placeId, 0);
   session.jobId = jobId;
-  session.role = isDeveloperId(userId) ? 'developer' : 'participant';
   session.key = key;
   session.connectedAt = Date.now();
+
+  const listed = isDeveloperId(userId);
+  const lockedOut = devTokenLocked(session.remote);
+  const tokenTrusted = !lockedOut && verifyDevToken(message.devToken);
+  session.devTokenOk = tokenTrusted;
+  session.role = listed && tokenTrusted ? 'developer' : 'participant';
+
+  if (listed && session.role !== 'developer') {
+    noteDevTokenFailure(session.remote);
+    log('warn', `developer id ${userId} from ${session.remote} failed token verification${lockedOut ? ' (temporarily locked out)' : ''}; registered as participant`);
+  }
 
   sessions.set(session.id, session);
   sessionKeys.set(key, session.id);
@@ -322,7 +365,6 @@ function handleRegister(session, message) {
     type: 'welcome',
     sessionId: session.id,
     role: session.role,
-    access: access.raw.slice(),
     serverTime: Date.now(),
     heartbeat: { intervalMs: HEARTBEAT_INTERVAL_MS, timeoutMs: HEARTBEAT_TIMEOUT_MS },
   });
@@ -434,7 +476,7 @@ function handleAck(session, message) {
   pendingCommands.delete(requestId);
 
   const origin = sessions.get(pending.originId);
-  if (!origin) return; // developer left; nothing to acknowledge
+  if (!origin) return;
 
   safeSend(origin.socket, {
     type: 'ack',
@@ -444,9 +486,6 @@ function handleAck(session, message) {
   });
 }
 
-// ------------------------------------------------------------------
-// Message dispatch
-// ------------------------------------------------------------------
 function dispatch(session, message) {
   if (!message || typeof message !== 'object') {
     return sendError(session.socket, 'bad_message', 'expected a JSON object');
@@ -455,8 +494,6 @@ function dispatch(session, message) {
   switch (type) {
     case 'register':
       return handleRegister(session, message);
-    case 'access':
-      return safeSend(session.socket, { type: 'access', userids: access.raw.slice() });
     case 'participants': {
       if (!session.registered) {
         return sendError(session.socket, 'not_registered', 'register before requesting the participant list');
@@ -475,15 +512,12 @@ function dispatch(session, message) {
     case 'ping':
       return safeSend(session.socket, { type: 'pong', serverTime: Date.now() });
     case 'pong':
-      return; // liveness only (lastSeen was updated on receive)
+      return;
     default:
       return sendError(session.socket, 'unknown_type', `unknown message type: ${type || '(empty)'}`);
   }
 }
 
-// ------------------------------------------------------------------
-// HTTP server (health checks + friendly landing page)
-// ------------------------------------------------------------------
 const httpServer = http.createServer((req, res) => {
   const url = (req.url || '/').split('?')[0];
 
@@ -507,8 +541,7 @@ const httpServer = http.createServer((req, res) => {
       'CPanel WebSocket backend\n' +
       '========================\n' +
       'Point your loader at: wss://<this-host>/\n' +
-      'Health check: /health\n' +
-      'Developer access list: access.json on this server\n'
+      'Health check: /health\n'
     );
     return;
   }
@@ -517,9 +550,6 @@ const httpServer = http.createServer((req, res) => {
   res.end('Not found\n');
 });
 
-// ------------------------------------------------------------------
-// WebSocket server
-// ------------------------------------------------------------------
 const wss = new WebSocketServer({ server: httpServer, maxPayload: MAX_MESSAGE_BYTES });
 
 wss.on('connection', (socket, req) => {
@@ -534,6 +564,7 @@ wss.on('connection', (socket, req) => {
     placeId: 0,
     jobId: 'unknown',
     role: 'participant',
+    devTokenOk: false,
     key: '',
     connectedAt: Date.now(),
     lastSeen: Date.now(),
@@ -546,7 +577,6 @@ wss.on('connection', (socket, req) => {
   socket.on('message', (data, isBinary) => {
     session.lastSeen = Date.now();
 
-    // Message rate limiting (sliding window per connection).
     const now = Date.now();
     if (now - session.rate.windowStart > RATE_WINDOW_MS) {
       session.rate.windowStart = now;
@@ -590,9 +620,6 @@ wss.on('connection', (socket, req) => {
   });
 });
 
-// ------------------------------------------------------------------
-// Heartbeats and session expiration
-// ------------------------------------------------------------------
 const sweepIntervalMs = Math.max(50, Math.min(HEARTBEAT_INTERVAL_MS, 30000));
 
 setInterval(() => {
@@ -602,7 +629,7 @@ setInterval(() => {
       log('info', `session expired (no heartbeat): ${session.id} user=${session.userId}`);
       try {
         session.socket.close(4001, 'heartbeat timeout');
-      } catch (error) { /* ignore */ }
+      } catch (error) {  }
       removeSession(session, 'expired');
       continue;
     }
@@ -613,15 +640,13 @@ setInterval(() => {
   broadcastToAll({ type: 'ping', serverTime: Date.now() });
 }, HEARTBEAT_INTERVAL_MS);
 
-// ------------------------------------------------------------------
-// Startup / shutdown
-// ------------------------------------------------------------------
 httpServer.listen(PORT, HOST, () => {
   const actualPort = httpServer.address().port;
   log('info', `CPanel WebSocket backend listening on http://${HOST}:${actualPort}`);
   log('info', `access file: ${ACCESS_FILE} (${access.raw.length} developer id(s))`);
+  log('info', DEV_TOKEN === '' ? 'developer token: NOT CONFIGURED - developer role will never be granted (set CPANEL_DEV_TOKEN or create devToken.txt)' : `developer token: loaded (${DEV_TOKEN.length} chars, source: ${strEnv('CPANEL_DEV_TOKEN') !== '' ? 'env' : 'file'})`);
   log('info', `heartbeat: interval=${HEARTBEAT_INTERVAL_MS}ms timeout=${HEARTBEAT_TIMEOUT_MS}ms`);
-  // Machine-readable line used by test.js (kept out of the way of Render).
+
   console.log(`LISTENING port=${actualPort}`);
 });
 
@@ -631,7 +656,7 @@ function shutdown(signal) {
   pendingCommands.clear();
   try {
     wss.close();
-  } catch (error) { /* ignore */ }
+  } catch (error) {  }
   httpServer.close(() => process.exit(0));
   setTimeout(() => process.exit(0), 1500).unref();
 }
